@@ -1,9 +1,14 @@
 #include <Arduino.h>
 #include <M5Unified.h>
+#include <WiFi.h>
+#include <SD.h>
+#include <cerrno>
+#include <cstring>
+#include <lwip/sockets.h>
+#include <lwip/inet.h>
+#include <esp_wifi.h>
+#include <unistd.h>
 #include "AudioOutputM5Speaker.h"
-#include <AudioFileSourceSD.h>
-#include <AudioGeneratorMP3.h>
-#include <AudioFileSourceBuffer.h>
 #include <Avatar.h> // https://github.com/meganetaaan/m5stack-avatar
 #include <Stackchan_system_config.h> // https://github.com/stack-chan/stackchan-arduino
 #include <Stackchan_servo.h> // https://github.com/stack-chan/stackchan-arduino
@@ -12,85 +17,100 @@
   goblib::UnifiedButton unifiedButton;
 #endif
 
+#ifndef VBAN_STREAM_NAME
+  #define VBAN_STREAM_NAME "Stream1"
+#endif
+
+#ifndef VBAN_AUDIO_ONLY
+  #define VBAN_AUDIO_ONLY 1
+#endif
+
 #define USE_SERVO
 #ifdef USE_SERVO
 #if defined(ARDUINO_M5STACK_Core2)
-  // #define SERVO_PIN_X 13  //Core2 PORT C
-  // #define SERVO_PIN_Y 14
- #define SERVO_PIN_X 13  //Core2 PORT A
- #define SERVO_PIN_Y 14
-#elif defined( ARDUINO_M5STACK_FIRE )
+  #define SERVO_PIN_X 13
+  #define SERVO_PIN_Y 14
+#elif defined(ARDUINO_M5STACK_FIRE)
   #define SERVO_PIN_X 21
   #define SERVO_PIN_Y 22
-#elif defined( ARDUINO_M5Stack_Core_ESP32 )
+#elif defined(ARDUINO_M5Stack_Core_ESP32)
   #define SERVO_PIN_X 21
   #define SERVO_PIN_Y 22
-#elif defined( ARDUINO_M5STACK_CORES3 )
+#elif defined(ARDUINO_M5STACK_CORES3)
   #define SERVO_PIN_X 1
   #define SERVO_PIN_Y 2
 #endif
 #endif
 
-/// set your wav filename
-const int maxFile = 100;
-String fileList[maxFile];
-int fileCount = 0;
-
 static constexpr size_t WAVE_SIZE = 320;
-static AudioOutputM5Speaker out(&M5.Speaker, m5spk_virtual_channel);
-static AudioGeneratorMP3 mp3;
-static AudioFileSourceSD *file = nullptr;
-static AudioFileSourceBuffer *buff = nullptr;
-static constexpr int SD_SPI_FREQUENCY = 25000000;
-static constexpr size_t AUDIO_FILE_BUFFER_SIZE = 192 * 1024;
+static constexpr int SD_SPI_FREQUENCY = 10000000;
 static constexpr TickType_t LIPSYNC_INTERVAL_TICKS = pdMS_TO_TICKS(150);
+static constexpr uint16_t VBAN_PORT = 6980;
+static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
+static constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 5000;
+static constexpr uint32_t WIFI_IP_DISPLAY_MS = 5000;
+static constexpr uint32_t STATUS_INTERVAL_MS = 1000;
+static constexpr uint8_t VBAN_HEADER_SIZE = 28;
+static constexpr size_t VBAN_PROTOCOL_MAX_SIZE = 1464;
+static constexpr int VBAN_SOCKET_RCVBUF = 64 * 1024;
+static constexpr uint8_t VBAN_SR_MASK = 0x1F;
+static constexpr uint8_t VBAN_PROTOCOL_MASK = 0xE0;
+static constexpr uint8_t VBAN_PROTOCOL_AUDIO = 0x00;
+static constexpr uint8_t VBAN_BIT_RESOLUTION_MASK = 0x07;
+static constexpr uint8_t VBAN_BITFMT_16_INT = 1;
+static constexpr uint8_t VBAN_RESERVED_MASK = 0x08;
+static constexpr uint8_t VBAN_CODEC_MASK = 0xF0;
+static constexpr uint8_t VBAN_CODEC_PCM = 0x00;
+static constexpr uint8_t VBAN_STREAM_NAME_SIZE = 16;
+static constexpr size_t VBAN_OUTPUT_CHANNELS = 2;
+static constexpr size_t VBAN_SAMPLES_MAX_NB = 256;
+static constexpr size_t VBAN_OUTPUT_SAMPLES_MAX = VBAN_SAMPLES_MAX_NB * VBAN_OUTPUT_CHANNELS;
+static constexpr size_t VBAN_AUDIO_QUEUE_LENGTH = 128;
+static constexpr size_t VBAN_AUDIO_PREFILL = 24;
+static constexpr size_t VBAN_AUDIO_BATCH_PACKETS = 4;
+static constexpr size_t VBAN_AUDIO_BATCH_SAMPLES_MAX = VBAN_OUTPUT_SAMPLES_MAX * VBAN_AUDIO_BATCH_PACKETS;
+static constexpr uint32_t VBAN_GAP_RESYNC_THRESHOLD = 64;
+static constexpr uint32_t VBAN_PLC_MAX_GAP_PACKETS = 8;
+static constexpr uint32_t VBAN_AUDIO_PACKET_WAIT_MS = 20;
+static constexpr UBaseType_t VBAN_RECEIVE_TASK_PRIORITY = 4;
+static constexpr UBaseType_t VBAN_AUDIO_TASK_PRIORITY = 6;
+static constexpr uint32_t VBAN_PLAYBACK_SAMPLE_RATE = 44100;
+
+static AudioOutputM5Speaker out(&M5.Speaker, m5spk_virtual_channel);
+static int udp_socket_fd = -1;
+static uint8_t vban_buffer[VBAN_PROTOCOL_MAX_SIZE];
+static int16_t playback_batch[VBAN_AUDIO_BATCH_SAMPLES_MAX];
+static int16_t silence_packet[VBAN_OUTPUT_SAMPLES_MAX];
+static QueueHandle_t free_packet_queue = nullptr;
+static QueueHandle_t audio_packet_queue = nullptr;
+static bool udp_started = false;
 static bool sd_ready = false;
-uint8_t *preallocateBuffer = nullptr;
-size_t preallocateBufferSize = 0;
+static uint32_t last_wifi_attempt_ms = 0;
+static uint32_t last_status_ms = 0;
+static uint32_t last_packet_ms = 0;
+static uint32_t valid_packets = 0;
+static uint32_t dropped_packets = 0;
+static uint32_t underrun_count = 0;
+static uint32_t packet_gap_count = 0;
+static uint32_t packet_conceal_count = 0;
+static uint32_t packet_out_of_order_count = 0;
+static uint32_t packet_resync_count = 0;
+static uint32_t current_vban_frame_delta = 0;
+static uint32_t max_vban_frame_delta = 0;
+static uint32_t jitter_prime_count = 0;
+static uint32_t audio_write_fail_count = 0;
+static int audio_last_error = 0;
+static uint32_t current_sample_rate = 48000;
+static uint32_t current_playback_sample_rate = VBAN_PLAYBACK_SAMPLE_RATE;
+static uint8_t current_channels = 0;
+static uint16_t current_frames_per_packet = 0;
+static uint32_t last_vban_frame = 0;
+static bool have_vban_frame = false;
+static bool avatar_started = false;
 
 using namespace m5avatar;
 Avatar avatar;
 StackchanSystemConfig system_config;
-
-void stop(void)
-{
-  if (file == nullptr && buff == nullptr) return;
-  out.stop();
-  if (mp3.isRunning()) {
-    mp3.stop();
-  }
-//  id3->RegisterMetadataCB(nullptr, nullptr);
-//  id3->close();
-  if (buff) {
-    buff->close();
-    delete buff;
-    buff = nullptr;
-  }
-  if (file) {
-    file->close();
-    delete file;
-  }
-  file = nullptr;
-}
-
-void play(const char* fname)
-{
-  Serial.printf("play file fname = %s\r\n", fname);
-  if (file != nullptr) { stop(); }
-  file = new AudioFileSourceSD(fname);
-  buff = new AudioFileSourceBuffer(file, preallocateBuffer, preallocateBufferSize);
-//  wav.begin(file, &out);
-  mp3.begin(buff, &out);
-  while (mp3.isRunning()) {
-//  wav.loop();
-    if (!mp3.loop()) {
-      break;
-    }
-    vTaskDelay(1);
-  }
-  stop();
-  avatar.setExpression(Expression::Neutral);
-}
 
 #ifdef USE_SERVO
 static constexpr uint32_t SERVO_MOVE_DURATION_MS = 500;
@@ -98,17 +118,451 @@ StackchanSERVO stackchanServo;
 #endif
 static fft_t fft;
 static int16_t raw_data[WAVE_SIZE * 2];
-static float lipsync_level_max = 10.0f; // リップシンクの上限初期値
+static float lipsync_level_max = 10.0f;
 float mouth_ratio = 0.0f;
+
+struct VBanHeader
+{
+  char vban[4];
+  uint8_t format_SR;
+  uint8_t format_nbs;
+  uint8_t format_nbc;
+  uint8_t format_bit;
+  char streamname[VBAN_STREAM_NAME_SIZE];
+  uint32_t nuFrame;
+} __attribute__((packed));
+
+struct VbanAudioPacket
+{
+  int16_t samples[VBAN_OUTPUT_SAMPLES_MAX];
+  size_t sample_count;
+  uint32_t sample_rate;
+  uint8_t channels;
+  bool stereo;
+};
+
+static VbanAudioPacket* packet_pool = nullptr;
+static VbanAudioPacket conceal_template = {};
+static bool have_conceal_template = false;
+
+static constexpr uint32_t VBanSRList[] = {
+  6000, 12000, 24000, 48000, 96000, 192000, 384000,
+  8000, 16000, 32000, 64000, 128000, 256000, 512000,
+  11025, 22050, 44100, 88200, 176400, 352800, 705600
+};
+
+static void drawStatus(const char* line1, const char* line2 = nullptr, const char* line3 = nullptr)
+{
+  if (avatar_started) {
+    M5_LOGI("%s", line1);
+    if (line2) M5_LOGI("%s", line2);
+    if (line3) M5_LOGI("%s", line3);
+    return;
+  }
+  M5.Display.fillScreen(TFT_BLACK);
+  M5.Display.setCursor(0, 0);
+  M5.Display.setTextSize(2);
+  M5.Display.println(line1);
+  if (line2) M5.Display.println(line2);
+  if (line3) M5.Display.println(line3);
+}
+
+static bool hasWifiCredentials()
+{
+  const String& ssid = system_config.getWiFiSetting()->ssid;
+  return ssid.length() > 0 && ssid != "YOUR_WIFI_SSID";
+}
+
+static void startUdp()
+{
+  if (udp_started) return;
+
+  udp_socket_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+  if (udp_socket_fd < 0) {
+    M5_LOGE("Failed to create VBAN UDP socket errno:%d", errno);
+    return;
+  }
+
+  int enable = 1;
+  setsockopt(udp_socket_fd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable));
+
+  int recv_buffer_size = VBAN_SOCKET_RCVBUF;
+  if (setsockopt(udp_socket_fd, SOL_SOCKET, SO_RCVBUF, &recv_buffer_size, sizeof(recv_buffer_size)) < 0) {
+    M5_LOGE("Failed to set VBAN UDP receive buffer errno:%d", errno);
+  }
+  socklen_t opt_len = sizeof(recv_buffer_size);
+  getsockopt(udp_socket_fd, SOL_SOCKET, SO_RCVBUF, &recv_buffer_size, &opt_len);
+
+  sockaddr_in listen_addr = {};
+  listen_addr.sin_family = AF_INET;
+  listen_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  listen_addr.sin_port = htons(VBAN_PORT);
+  if (bind(udp_socket_fd, reinterpret_cast<sockaddr*>(&listen_addr), sizeof(listen_addr)) < 0) {
+    M5_LOGE("Failed to bind VBAN UDP socket errno:%d", errno);
+    close(udp_socket_fd);
+    udp_socket_fd = -1;
+    return;
+  }
+
+  udp_started = true;
+  M5_LOGI("VBAN UDP listening on %u rcvbuf:%d", VBAN_PORT, recv_buffer_size);
+}
+
+static void stopUdp()
+{
+  if (!udp_started) return;
+  close(udp_socket_fd);
+  udp_socket_fd = -1;
+  udp_started = false;
+}
+
+static void connectWiFi(bool blocking)
+{
+  if (!hasWifiCredentials()) {
+    drawStatus("WiFi not configured", "Set wifi.ssid/password", "in /yaml/SC_SecConfig.yaml");
+    return;
+  }
+
+  const wifi_s* wifi = system_config.getWiFiSetting();
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.begin(wifi->ssid.c_str(), wifi->password.c_str());
+  last_wifi_attempt_ms = millis();
+
+  M5_LOGI("Connecting WiFi SSID: %s", wifi->ssid.c_str());
+  drawStatus("Connecting WiFi...", wifi->ssid.c_str());
+
+  if (!blocking) return;
+
+  uint32_t started_at = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - started_at < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(250);
+    M5.update();
+  }
+}
+
+static void showWiFiAddressOnStartup()
+{
+  if (WiFi.status() != WL_CONNECTED) {
+    M5_LOGE("WiFi connection failed or timed out");
+    drawStatus("WiFi connect failed", "Will retry");
+    delay(WIFI_IP_DISPLAY_MS);
+    return;
+  }
+
+  IPAddress ip = WiFi.localIP();
+  M5_LOGI("WiFi connected SSID:%s IP:%s",
+          system_config.getWiFiSetting()->ssid.c_str(), ip.toString().c_str());
+  M5_LOGI("VBAN listening address: %s:%u stream:%s",
+          ip.toString().c_str(), VBAN_PORT, VBAN_STREAM_NAME);
+
+  drawStatus("WiFi connected", ip.toString().c_str(), "VBAN UDP 6980");
+  delay(WIFI_IP_DISPLAY_MS);
+}
+
+static void maintainWiFi()
+{
+  if (!hasWifiCredentials()) return;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    startUdp();
+    return;
+  }
+
+  stopUdp();
+  if (millis() - last_wifi_attempt_ms >= WIFI_RECONNECT_INTERVAL_MS) {
+    M5_LOGI("WiFi disconnected. Reconnecting...");
+    connectWiFi(false);
+  }
+}
+
+static bool streamNameMatches(const char* packet_stream)
+{
+  char expected[VBAN_STREAM_NAME_SIZE] = {};
+  strncpy(expected, VBAN_STREAM_NAME, sizeof(expected));
+  return memcmp(packet_stream, expected, VBAN_STREAM_NAME_SIZE) == 0;
+}
+
+static bool validateVbanPacket(const uint8_t* buffer, size_t size, const VBanHeader** header)
+{
+  if (size <= VBAN_HEADER_SIZE) return false;
+
+  const VBanHeader* hdr = reinterpret_cast<const VBanHeader*>(buffer);
+  if (memcmp(hdr->vban, "VBAN", 4) != 0) return false;
+  if (!streamNameMatches(hdr->streamname)) return false;
+  if ((hdr->format_SR & VBAN_PROTOCOL_MASK) != VBAN_PROTOCOL_AUDIO) return false;
+  if ((hdr->format_SR & VBAN_SR_MASK) >= (sizeof(VBanSRList) / sizeof(VBanSRList[0]))) return false;
+  if (hdr->format_bit & VBAN_RESERVED_MASK) return false;
+  if ((hdr->format_bit & VBAN_CODEC_MASK) != VBAN_CODEC_PCM) return false;
+  if ((hdr->format_bit & VBAN_BIT_RESOLUTION_MASK) != VBAN_BITFMT_16_INT) return false;
+
+  const size_t channels = hdr->format_nbc + 1;
+  const size_t samples = hdr->format_nbs + 1;
+  const size_t payload_size = samples * channels * sizeof(int16_t);
+  if (payload_size != size - VBAN_HEADER_SIZE) return false;
+  if (samples > VBAN_SAMPLES_MAX_NB) return false;
+
+  *header = hdr;
+  return true;
+}
+
+static void releaseAudioPacket(VbanAudioPacket* packet)
+{
+  if (packet != nullptr && free_packet_queue != nullptr) {
+    xQueueSend(free_packet_queue, &packet, 0);
+  }
+}
+
+static bool buildAudioPacket(const uint8_t* buffer, const VBanHeader* hdr, VbanAudioPacket* packet)
+{
+  const int16_t* payload = reinterpret_cast<const int16_t*>(buffer + VBAN_HEADER_SIZE);
+  const uint8_t channels = hdr->format_nbc + 1;
+  const uint16_t frames = hdr->format_nbs + 1;
+
+  packet->sample_count = 0;
+  packet->sample_rate = VBanSRList[hdr->format_SR & VBAN_SR_MASK];
+  packet->channels = channels;
+  packet->stereo = true;
+  if (channels == 1) {
+    for (uint16_t i = 0; i < frames; ++i) {
+      packet->samples[packet->sample_count++] = payload[i];
+      packet->samples[packet->sample_count++] = payload[i];
+    }
+  } else {
+    for (uint16_t i = 0; i < frames; ++i) {
+      packet->samples[packet->sample_count++] = payload[i * channels];
+      packet->samples[packet->sample_count++] = payload[i * channels + 1];
+    }
+  }
+  return packet->sample_count > 0;
+}
+
+static VbanAudioPacket* acquireAudioPacket()
+{
+  VbanAudioPacket* packet = nullptr;
+  if (xQueueReceive(free_packet_queue, &packet, 0) == pdTRUE) {
+    return packet;
+  }
+
+  VbanAudioPacket* stale_packet = nullptr;
+  if (xQueueReceive(audio_packet_queue, &stale_packet, 0) == pdTRUE) {
+    releaseAudioPacket(stale_packet);
+    xQueueReceive(free_packet_queue, &packet, 0);
+  }
+  return packet;
+}
+
+static VbanAudioPacket* acquireFreeAudioPacket()
+{
+  VbanAudioPacket* packet = nullptr;
+  if (free_packet_queue != nullptr && xQueueReceive(free_packet_queue, &packet, 0) == pdTRUE) {
+    return packet;
+  }
+  return nullptr;
+}
+
+static bool queueAudioPacket(VbanAudioPacket* packet)
+{
+  if (packet == nullptr) return false;
+  if (xQueueSend(audio_packet_queue, &packet, 0) == pdTRUE) {
+    return true;
+  }
+  releaseAudioPacket(packet);
+  ++dropped_packets;
+  return false;
+}
+
+static void enqueueConcealPackets(uint32_t missing_packets)
+{
+  if (!have_conceal_template) return;
+  uint32_t conceal_packets = missing_packets;
+  if (conceal_packets > VBAN_PLC_MAX_GAP_PACKETS) {
+    conceal_packets = VBAN_PLC_MAX_GAP_PACKETS;
+  }
+
+  for (uint32_t i = 0; i < conceal_packets; ++i) {
+    VbanAudioPacket* packet = acquireFreeAudioPacket();
+    if (packet == nullptr) {
+      return;
+    }
+    *packet = conceal_template;
+    if (queueAudioPacket(packet)) {
+      ++packet_conceal_count;
+    } else {
+      return;
+    }
+  }
+}
+
+static void enqueueVbanPacket(const uint8_t* buffer, size_t size, const VBanHeader* hdr)
+{
+  if (free_packet_queue == nullptr || audio_packet_queue == nullptr) return;
+
+  uint32_t missing_packets = 0;
+  if (have_vban_frame) {
+    uint32_t delta = hdr->nuFrame - last_vban_frame;
+    current_vban_frame_delta = delta;
+    if (delta > max_vban_frame_delta && delta < 0x80000000UL) {
+      max_vban_frame_delta = delta;
+    }
+    if (delta > VBAN_GAP_RESYNC_THRESHOLD && delta < 0x80000000UL) {
+      ++packet_resync_count;
+    } else if (delta > 1) {
+      if (delta < 0x80000000UL) {
+        missing_packets = delta - 1;
+        packet_gap_count += missing_packets;
+      } else {
+        ++packet_out_of_order_count;
+      }
+    }
+  } else {
+    have_vban_frame = true;
+  }
+  last_vban_frame = hdr->nuFrame;
+  enqueueConcealPackets(missing_packets);
+
+  VbanAudioPacket* packet = acquireAudioPacket();
+  if (packet == nullptr) {
+    ++dropped_packets;
+    return;
+  }
+
+  if (!buildAudioPacket(buffer, hdr, packet)) {
+    releaseAudioPacket(packet);
+    ++dropped_packets;
+    return;
+  }
+
+  current_sample_rate = packet->sample_rate;
+  current_channels = packet->channels;
+  current_frames_per_packet = packet->sample_count / VBAN_OUTPUT_CHANNELS;
+  last_packet_ms = millis();
+  if (queueAudioPacket(packet)) {
+    conceal_template = *packet;
+    have_conceal_template = true;
+    ++valid_packets;
+  }
+}
+
+static bool receiveVban()
+{
+  if (!udp_started || udp_socket_fd < 0) return false;
+
+  sockaddr_in source_addr = {};
+  socklen_t source_addr_len = sizeof(source_addr);
+  int read_size = recvfrom(udp_socket_fd, vban_buffer, sizeof(vban_buffer), 0,
+                           reinterpret_cast<sockaddr*>(&source_addr), &source_addr_len);
+  if (read_size < 0) {
+    ++dropped_packets;
+    return true;
+  }
+
+  const VBanHeader* hdr = nullptr;
+  if (read_size > 0 && validateVbanPacket(vban_buffer, read_size, &hdr)) {
+    enqueueVbanPacket(vban_buffer, read_size, hdr);
+  } else {
+    ++dropped_packets;
+  }
+  return true;
+}
+
+static bool initAudioQueues()
+{
+  packet_pool = static_cast<VbanAudioPacket*>(ps_malloc(sizeof(VbanAudioPacket) * VBAN_AUDIO_QUEUE_LENGTH));
+  if (packet_pool == nullptr) {
+    packet_pool = static_cast<VbanAudioPacket*>(malloc(sizeof(VbanAudioPacket) * VBAN_AUDIO_QUEUE_LENGTH));
+  }
+  free_packet_queue = xQueueCreate(VBAN_AUDIO_QUEUE_LENGTH, sizeof(VbanAudioPacket*));
+  audio_packet_queue = xQueueCreate(VBAN_AUDIO_QUEUE_LENGTH, sizeof(VbanAudioPacket*));
+  if (packet_pool == nullptr || free_packet_queue == nullptr || audio_packet_queue == nullptr) {
+    M5_LOGE("Failed to allocate VBAN audio queues");
+    return false;
+  }
+
+  for (size_t i = 0; i < VBAN_AUDIO_QUEUE_LENGTH; ++i) {
+    VbanAudioPacket* packet = &packet_pool[i];
+    xQueueSend(free_packet_queue, &packet, 0);
+  }
+  return true;
+}
+
+static void vbanReceiveTask(void*)
+{
+  for (;;) {
+    if (!receiveVban()) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+  }
+}
+
+static void vbanAudioTask(void*)
+{
+  bool primed = false;
+  for (;;) {
+    if (audio_packet_queue == nullptr) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    if (!primed) {
+      while (uxQueueMessagesWaiting(audio_packet_queue) < VBAN_AUDIO_PREFILL) {
+        vTaskDelay(1);
+      }
+      primed = true;
+      ++jitter_prime_count;
+    }
+
+    VbanAudioPacket* packet = nullptr;
+    const bool got_packet = xQueueReceive(audio_packet_queue, &packet, pdMS_TO_TICKS(VBAN_AUDIO_PACKET_WAIT_MS)) == pdTRUE;
+    if (got_packet) {
+      const uint32_t sample_rate = packet->sample_rate;
+      const bool stereo = packet->stereo;
+      size_t batch_sample_count = 0;
+
+      memcpy(&playback_batch[batch_sample_count], packet->samples, packet->sample_count * sizeof(int16_t));
+      batch_sample_count += packet->sample_count;
+      releaseAudioPacket(packet);
+
+      for (size_t i = 1; i < VBAN_AUDIO_BATCH_PACKETS; ++i) {
+        VbanAudioPacket* next_packet = nullptr;
+        if (xQueueReceive(audio_packet_queue, &next_packet, 0) != pdTRUE) {
+          break;
+        }
+
+        if (next_packet->sample_rate != sample_rate || next_packet->stereo != stereo || batch_sample_count + next_packet->sample_count > VBAN_AUDIO_BATCH_SAMPLES_MAX) {
+          xQueueSendToFront(audio_packet_queue, &next_packet, 0);
+          break;
+        }
+
+        memcpy(&playback_batch[batch_sample_count], next_packet->samples, next_packet->sample_count * sizeof(int16_t));
+        batch_sample_count += next_packet->sample_count;
+        releaseAudioPacket(next_packet);
+      }
+
+      current_playback_sample_rate = sample_rate;
+      out.playPcm16(playback_batch, batch_sample_count, sample_rate, stereo);
+      audio_write_fail_count = out.getWriteFailCount();
+      audio_last_error = out.getLastError();
+    } else {
+      ++underrun_count;
+      const size_t silence_sample_count = current_frames_per_packet
+        ? current_frames_per_packet * VBAN_OUTPUT_CHANNELS
+        : 103 * VBAN_OUTPUT_CHANNELS;
+      out.playPcm16(silence_packet, silence_sample_count, current_playback_sample_rate, true);
+      audio_write_fail_count = out.getWriteFailCount();
+      audio_last_error = out.getLastError();
+    }
+  }
+}
 
 void lipSync(void *args)
 {
-  float gazeX, gazeY;
-  int level = 0;
   uint32_t last_update_count = 0;
   DriveContext *ctx = (DriveContext *)args;
   Avatar *avatar = ctx->getAvatar();
-   for (;;)
+  for (;;)
   {
     uint64_t level = 0;
     uint32_t update_count = out.getUpdateCount();
@@ -118,21 +572,17 @@ void lipSync(void *args)
       if (buf) {
         memcpy(raw_data, buf, WAVE_SIZE * 2 * sizeof(int16_t));
         fft.exec(raw_data);
-        for (size_t bx = 6; bx <= 48; bx += 2) { // 再生負荷を抑えるため、リップシンク用の帯域を間引いて集計する。
+        for (size_t bx = 6; bx <= 48; bx += 2) {
           int32_t f = fft.get(bx);
           level += abs(f);
-          //Serial.printf("bx:%d, f:%d\n", bx, f) ;
         }
-        //Serial.printf("level:%d\n", level >> 16);
       }
     }
 
-    // スレッド内でログを出そうとすると不具合が起きる場合があります。
-    //Serial.printf("data=%d\n\r", level >> 16);
-    mouth_ratio = (float)(level >> 16)/lipsync_level_max;
+    mouth_ratio = (float)(level >> 16) / lipsync_level_max;
     if (mouth_ratio > 1.2f) {
       if (mouth_ratio > 1.5f) {
-        lipsync_level_max += 10.0f; // リップシンク上限を大幅に超えるごとに上限を上げていく。
+        lipsync_level_max += 10.0f;
       }
       mouth_ratio = 1.2f;
     }
@@ -147,15 +597,15 @@ void servo(void *args)
   float gazeX, gazeY;
   DriveContext *ctx = (DriveContext *)args;
   Avatar *avatar = ctx->getAvatar();
-   for (;;)
+  for (;;)
   {
 #ifdef USE_SERVO
     avatar->getGaze(&gazeY, &gazeX);
     int servoX = system_config.getServoInfo(AXIS_X)->start_degree + (int)(20.0 * gazeX);
     int servoY = system_config.getServoInfo(AXIS_Y)->start_degree;
-    if(gazeY < 0) {
+    if (gazeY < 0) {
       int tmp = (int)(15.0 * gazeY);
-      if(tmp > 15) tmp = 15;
+      if (tmp > 15) tmp = 15;
       servoY += tmp;
     } else {
       servoY += (int)(10.0 * gazeY);
@@ -168,11 +618,8 @@ void servo(void *args)
   }
 }
 
-static void speachTask(void*)
+void Servo_setup()
 {
-}
-
-void Servo_setup() {
 #ifdef USE_SERVO
   stackchanServo.begin(system_config.getServoInfo(AXIS_X)->pin,
                        system_config.getServoInfo(AXIS_X)->start_degree,
@@ -187,133 +634,134 @@ void Servo_setup() {
 
 void config_read()
 {
-  system_config.loadConfig(SD, "");
+  if (sd_ready) {
+    system_config.loadConfig(SD, "");
+  }
 }
 
-void file_read()
+static void updateStatus()
 {
- // SDカードマウント待ち
-  if (!sd_ready) return;
-  File root = SD.open("/mp3");
-  if (root) {
-    File file = root.openNextFile();
-    while (file) {
-      if (file.isDirectory()) {
-        // Dir skip
-      } else {
-        // File
-        String filename = file.name();
-        String dirname = "/mp3/";
-        Serial.println(filename);
-//        M5.Lcd.println(filename.indexOf(".wav"));
-        if (filename.indexOf("mp3") != -1) {
-          // Find
-          fileList[fileCount] = dirname + filename;
-          fileCount++;
-          if (maxFile <= fileCount) {
-            break;
-          }
-        }
-      }
-      file.close();
-      file = root.openNextFile();
-    }
-    root.close();
-  }
+  if (millis() - last_status_ms < STATUS_INTERVAL_MS) return;
+  last_status_ms = millis();
 
-  Serial.println("File List");
-  M5.Lcd.println("File List");
-  for (int i = 0; i < fileCount; i++) {
-    Serial.println(fileList[i]);
-    M5.Lcd.println(fileList[i]);
+  if (!hasWifiCredentials()) return;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    static uint32_t last_log_ms = 0;
+    static uint32_t last_ok = 0;
+    static uint32_t last_plc = 0;
+    static uint32_t last_ms = 0;
+    if (millis() - last_log_ms >= 5000) {
+      uint32_t now = millis();
+      uint32_t delta_ms = last_ms ? now - last_ms : 0;
+      uint32_t delta_ok = valid_packets - last_ok;
+      uint32_t delta_plc = packet_conceal_count - last_plc;
+      float packet_rate = delta_ms ? (delta_ok * 1000.0f / delta_ms) : 0.0f;
+      float audio_rate = packet_rate * current_frames_per_packet;
+      float effective_audio_rate = delta_ms ? ((delta_ok + delta_plc) * 1000.0f / delta_ms * current_frames_per_packet) : 0.0f;
+      unsigned queued_packets = audio_packet_queue ? (unsigned)uxQueueMessagesWaiting(audio_packet_queue) : 0;
+      float buffer_ms = (current_frames_per_packet && current_playback_sample_rate)
+        ? (queued_packets * current_frames_per_packet * 1000.0f / current_playback_sample_rate)
+        : 0.0f;
+      last_ms = now;
+      last_ok = valid_packets;
+      last_plc = packet_conceal_count;
+      last_log_ms = millis();
+      M5_LOGI("VBAN %s:%u %s %luHz play:%luHz %uch frames:%u ok:%lu drop:%lu gap:%lu plc:%lu ooo:%lu resync:%lu nu:%lu maxNu:%lu underrun:%lu prime:%lu queued:%u bufMs:%.1f i2s:%d/%d/%d amp:%u i2sFail:%lu i2sErr:%d pps:%.1f audioHz:%.1f effHz:%.1f",
+              WiFi.localIP().toString().c_str(), VBAN_PORT, VBAN_STREAM_NAME,
+              current_sample_rate, current_playback_sample_rate, current_channels, current_frames_per_packet, valid_packets, dropped_packets,
+              packet_gap_count, packet_conceal_count, packet_out_of_order_count, packet_resync_count,
+              current_vban_frame_delta, max_vban_frame_delta,
+              underrun_count, jitter_prime_count, queued_packets, buffer_ms,
+              out.getBckPin(), out.getWsPin(), out.getDataOutPin(), out.isAmpEnabled(),
+              audio_write_fail_count, audio_last_error, packet_rate, audio_rate, effective_audio_rate);
+    }
   }
-  delay(2000);
 }
 
-void setup() {
-  
+void setup()
+{
   auto cfg = M5.config();
-
-  cfg.external_spk = true;    /// use external speaker (SPK HAT / ATOMIC SPK)
-//cfg.external_spk_detail.omit_atomic_spk = true; // exclude ATOMIC SPK
-//cfg.external_spk_detail.omit_spk_hat    = true; // exclude SPK HAT
+  cfg.internal_spk = true;
+  cfg.external_spk = true;
+  cfg.serial_baudrate = 115200;
 
   M5.begin(cfg);
-#if defined( ARDUINO_M5STACK_CORES3 )
+  M5.Log.setLogLevel(m5::log_target_serial, ESP_LOG_INFO);
+  M5_LOGI("M5Unified Stack-chan VBAN receiver starting");
+#if defined(ARDUINO_M5STACK_CORES3)
   unifiedButton.begin(&M5.Display, goblib::UnifiedButton::appearance_t::transparent_all);
 #endif
 
-  { /// custom setting
+  {
     auto spk_cfg = M5.Speaker.config();
-    /// Increasing the sample_rate will improve the sound quality instead of increasing the CPU load.
-    spk_cfg.sample_rate = 48000; // default:64000 (64kHz)  e.g. 48000 , 50000 , 80000 , 96000 , 100000 , 128000 , 144000 , 192000 , 200000
-//    spk_cfg.sample_rate = 48000; // default:64000 (64kHz)  e.g. 48000 , 50000 , 80000 , 96000 , 100000 , 128000 , 144000 , 192000 , 200000
-    //spk_cfg.task_priority = configMAX_PRIORITIES - 2;
-    // 音声が途切れる場合は下記3つのパラメータを調整してみてください。（あまり増やすと動かなくなる場合あり）
-    spk_cfg.task_priority = 2;
-    spk_cfg.dma_buf_count = 32;
+    spk_cfg.sample_rate = VBAN_PLAYBACK_SAMPLE_RATE;
+    spk_cfg.task_priority = 5;
+    spk_cfg.dma_buf_count = 16;
     spk_cfg.dma_buf_len = 512;
     spk_cfg.task_pinned_core = PRO_CPU_NUM;
     M5.Speaker.config(spk_cfg);
   }
-  M5.begin(cfg);
 
-  M5.Lcd.clear();
-  M5.Lcd.setCursor(0,0);
-  M5.Lcd.setTextSize(2);
-  M5.Speaker.begin();
+  M5.Display.clear();
+  M5.Display.setCursor(0, 0);
+  M5.Display.setTextSize(2);
+  auto active_spk_cfg = M5.Speaker.config();
+  M5_LOGI("Direct I2S config port:%d bck:%d ws:%d data:%d mck:%d dma:%u/%u",
+          active_spk_cfg.i2s_port, active_spk_cfg.pin_bck, active_spk_cfg.pin_ws,
+          active_spk_cfg.pin_data_out, active_spk_cfg.pin_mck,
+          (unsigned)active_spk_cfg.dma_buf_count, (unsigned)active_spk_cfg.dma_buf_len);
+  if (!out.begin(active_spk_cfg, VBAN_PLAYBACK_SAMPLE_RATE)) {
+    M5_LOGE("Failed to initialize direct I2S audio output");
+  } else {
+    M5_LOGI("Direct I2S audio output initialized port:%d bck:%d ws:%d data:%d amp:%u",
+            out.getPort(), out.getBckPin(), out.getWsPin(), out.getDataOutPin(), out.isAmpEnabled());
+  }
+  initAudioQueues();
+
   for (int time_out = 0; time_out <= 6; ++time_out) {
     if (SD.begin(GPIO_NUM_4, SPI, SD_SPI_FREQUENCY)) {
       sd_ready = true;
       break;
     }
-    Serial.println("SD Wait...");
-    M5.Lcd.println("SD Wait...");
+    M5_LOGI("SD Wait...");
+    M5.Display.println("SD Wait...");
     delay(500);
   }
+
   config_read();
-  preallocateBuffer = (uint8_t *)ps_malloc(AUDIO_FILE_BUFFER_SIZE);
-  if (preallocateBuffer) {
-    preallocateBufferSize = AUDIO_FILE_BUFFER_SIZE;
-  } else {
-    preallocateBufferSize = 96 * 1024;
-    preallocateBuffer = (uint8_t *)malloc(preallocateBufferSize);
-  }
-  if (!preallocateBuffer) {
-    M5.Display.printf("FATAL ERROR: Unable to preallocate %d bytes for audio\n", preallocateBufferSize);
-    for (;;) { delay(1000); }
-  }
   M5.Speaker.setChannelVolume(m5spk_virtual_channel, system_config.getBluetoothSetting()->start_volume);
   M5.Speaker.setVolume(system_config.getBluetoothSetting()->start_volume);
+  out.setVolume(system_config.getBluetoothSetting()->start_volume);
+  M5_LOGI("Audio volume:%u", system_config.getBluetoothSetting()->start_volume);
 
-  M5.Speaker.tone(2000, 100);
-  Servo_setup();
-  delay(1000);
-  file_read();
-  delay(100);
+  if (!VBAN_AUDIO_ONLY) {
+    Servo_setup();
+  } else {
+    M5_LOGI("VBAN audio-only mode enabled: avatar, servo, and lipsync tasks are disabled");
+  }
+  connectWiFi(true);
+  maintainWiFi();
+  showWiFiAddressOnStartup();
 
-  avatar.init();
-  avatar.addTask(lipSync, "lipSync");
-  avatar.addTask(servo, "servo");
-//  xTaskCreateUniversal(speachTask, "speachTask", 4096, nullptr, 1, nullptr, APP_CPU_NUM);
+  if (!VBAN_AUDIO_ONLY) {
+    avatar.init();
+    avatar_started = true;
+    avatar.addTask(lipSync, "lipSync");
+    avatar.addTask(servo, "servo");
+  }
+
+  xTaskCreatePinnedToCore(vbanReceiveTask, "vbanRecv", 8192, nullptr, VBAN_RECEIVE_TASK_PRIORITY, nullptr, APP_CPU_NUM);
+  xTaskCreatePinnedToCore(vbanAudioTask, "vbanAudio", 8192, nullptr, VBAN_AUDIO_TASK_PRIORITY, nullptr, PRO_CPU_NUM);
 }
 
-void loop() {
+void loop()
+{
   M5.update();
-#if defined( ARDUINO_M5STACK_CORES3 )
+#if defined(ARDUINO_M5STACK_CORES3)
   unifiedButton.update();
 #endif
-  float gazeX, gazeY;
-  int data_index = 0;
-  avatar.getGaze(&gazeY, &gazeX);
-  if(!mp3.isRunning()) {
-    data_index = random(0, fileCount);
-    Serial.printf("data_index = %d fileCount = %d \r\n", data_index, fileCount);
-    if(data_index < fileCount){
-      avatar.setExpression(Expression::Happy);
-      // Serial.printf("data_index-data_num = %d\r\n", data_index-data_num);
-      play(fileList[data_index].c_str());
-    }
-    vTaskDelay(2000 + 1500 * random(20));
-  }
+  maintainWiFi();
+  updateStatus();
+  vTaskDelay(1);
 }

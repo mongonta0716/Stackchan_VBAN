@@ -1,0 +1,8 @@
+# Personal information settings.
+wifi:
+  ssid: "YOUR_WIFI_SSID"
+  password: "YOUR_WIFI_PASSWORD"
+apikey:
+  stt: "YOUR_APIKEY"
+  aiservice: "YOUR_APIKEY"
+  tts: "YOUR_APIKEY"
