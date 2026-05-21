@@ -22,7 +22,12 @@ class AudioOutputM5Speaker
       effective_config.sample_rate = sample_rate;
       _i2s_port = effective_config.i2s_port;
       if (effective_config.pin_bck < 0 || effective_config.pin_ws < 0 || effective_config.pin_data_out < 0) {
-#if defined(ARDUINO_M5STACK_CORES3)
+#if defined(USE_ATOMIC_ECHO_BASE)
+        effective_config.i2s_port = I2S_NUM_0;
+        effective_config.pin_bck = GPIO_NUM_8;
+        effective_config.pin_ws = GPIO_NUM_6;
+        effective_config.pin_data_out = GPIO_NUM_5;
+#elif defined(ARDUINO_M5STACK_CORES3)
         effective_config.i2s_port = I2S_NUM_1;
         effective_config.pin_bck = GPIO_NUM_34;
         effective_config.pin_ws = GPIO_NUM_33;
@@ -116,17 +121,26 @@ class AudioOutputM5Speaker
       size_t copy_count = sample_count < tri_buf_size ? sample_count : tri_buf_size;
       if (_volume >= 255) {
         memcpy(_tri_buffer[_tri_index], samples, copy_count * sizeof(int16_t));
+      } else if (_volume == 0) {
+        memset(_tri_buffer[_tri_index], 0, copy_count * sizeof(int16_t));
       } else {
         for (size_t i = 0; i < copy_count; ++i) {
           _tri_buffer[_tri_index][i] = (static_cast<int32_t>(samples[i]) * _volume) / 255;
         }
       }
-      if (copy_count < tri_buf_size)
+      const size_t lipsync_sample_count = 640;
+      const size_t clear_count = (copy_count < lipsync_sample_count) ? (lipsync_sample_count - copy_count) : 0;
+      if (clear_count)
       {
-        memset(&_tri_buffer[_tri_index][copy_count], 0, (tri_buf_size - copy_count) * sizeof(int16_t));
+        memset(&_tri_buffer[_tri_index][copy_count], 0, clear_count * sizeof(int16_t));
       }
       size_t write_bytes = 0;
-      esp_err_t err = i2s_write(_i2s_port, _tri_buffer[_tri_index], copy_count * sizeof(int16_t), &write_bytes, pdMS_TO_TICKS(50));
+      const size_t frame_count = stereo ? ((copy_count + 1) / 2) : copy_count;
+      uint32_t timeout_ms = _sample_rate ? (static_cast<uint32_t>(frame_count) * 1000U / _sample_rate) + 5U : 20U;
+      if (timeout_ms < 10U) timeout_ms = 10U;
+      TickType_t write_timeout = pdMS_TO_TICKS(timeout_ms);
+      if (write_timeout == 0) write_timeout = 1;
+      esp_err_t err = i2s_write(_i2s_port, _tri_buffer[_tri_index], copy_count * sizeof(int16_t), &write_bytes, write_timeout);
       _last_error = err;
       _tri_index = (_tri_index + 1) % tri_buffer_count;
       bool written = (err == ESP_OK && write_bytes == copy_count * sizeof(int16_t));
@@ -152,7 +166,9 @@ class AudioOutputM5Speaker
   protected:
     m5::Speaker_Class* _m5sound;
     uint8_t _virtual_ch;
-#if defined(ARDUINO_M5STACK_CORES3)
+#if defined(USE_ATOMIC_ECHO_BASE)
+    i2s_port_t _i2s_port = I2S_NUM_0;
+#elif defined(ARDUINO_M5STACK_CORES3)
     i2s_port_t _i2s_port = I2S_NUM_1;
 #else
     i2s_port_t _i2s_port = I2S_NUM_1;
@@ -187,7 +203,9 @@ class AudioOutputM5Speaker
 
     void enableAmp(const m5::speaker_config_t& speaker_config, uint32_t sample_rate)
     {
-#if defined(ARDUINO_M5STACK_CORES3)
+#if defined(USE_ATOMIC_ECHO_BASE)
+      _amp_enabled = true;
+#elif defined(ARDUINO_M5STACK_CORES3)
       if (speaker_config.pin_bck != GPIO_NUM_34) return;
       _amp_enabled = true;
       static constexpr uint8_t aw88298_i2c_addr = 0x36;
@@ -233,26 +251,24 @@ class AudioOutputM5Speaker
     }
 };
 
-#define FFT_SIZE 256
 class fft_t
 {
-  float _wr[FFT_SIZE + 1];
-  float _wi[FFT_SIZE + 1];
-  float _fr[FFT_SIZE + 1];
-  float _fi[FFT_SIZE + 1];
-  uint16_t _br[FFT_SIZE + 1];
+  static constexpr size_t fft_size = 256;
+  float _wr[fft_size + 1];
+  float _wi[fft_size + 1];
+  float _fr[fft_size + 1];
+  float _fi[fft_size + 1];
+  uint16_t _br[fft_size + 1];
   size_t _ie;
 
 public:
   fft_t(void)
   {
-#ifndef M_PI
-#define M_PI 3.141592653
-#endif
-    _ie = logf( (float)FFT_SIZE ) / log(2.0) + 0.5;
-    static constexpr float omega = 2.0f * M_PI / FFT_SIZE;
-    static constexpr int s4 = FFT_SIZE / 4;
-    static constexpr int s2 = FFT_SIZE / 2;
+    static constexpr float pi = 3.141592653f;
+    _ie = logf( (float)fft_size ) / log(2.0) + 0.5;
+    static constexpr float omega = 2.0f * pi / fft_size;
+    static constexpr int s4 = fft_size / 4;
+    static constexpr int s2 = fft_size / 2;
     for ( int i = 1 ; i < s4 ; ++i)
     {
     float f = cosf(omega * i);
@@ -265,7 +281,7 @@ public:
 
     size_t je = 1;
     _br[0] = 0;
-    _br[1] = FFT_SIZE / 2;
+    _br[1] = fft_size / 2;
     for ( size_t i = 0 ; i < _ie - 1 ; ++i )
     {
       _br[ je << 1 ] = _br[ je ] >> 1;
@@ -280,10 +296,10 @@ public:
   void exec(const int16_t* in)
   {
     memset(_fi, 0, sizeof(_fi));
-    for ( size_t j = 0 ; j < FFT_SIZE / 2 ; ++j )
+    for ( size_t j = 0 ; j < fft_size / 2 ; ++j )
     {
       float basej = 0.25 * (1.0-_wr[j]);
-      size_t r = FFT_SIZE - j - 1;
+      size_t r = fft_size - j - 1;
 
       /// perform han window and stereo to mono convert.
       _fr[_br[j]] = basej * (in[j * 2] + in[j * 2 + 1]);
@@ -296,7 +312,7 @@ public:
     {
       size_t ke = s;
       s <<= 1;
-      size_t je = FFT_SIZE / s;
+      size_t je = fft_size / s;
       size_t j = 0;
       do
       {
@@ -319,6 +335,6 @@ public:
 
   uint32_t get(size_t index)
   {
-    return (index < FFT_SIZE / 2) ? (uint32_t)sqrtf(_fr[ index ] * _fr[ index ] + _fi[ index ] * _fi[ index ]) : 0u;
+    return (index < fft_size / 2) ? (uint32_t)sqrtf(_fr[ index ] * _fr[ index ] + _fi[ index ] * _fi[ index ]) : 0u;
   }
 };
