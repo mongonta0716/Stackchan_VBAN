@@ -12,6 +12,7 @@
 #include <lwip/sockets.h>
 #include <lwip/inet.h>
 #include <esp_wifi.h>
+#include <esp_log.h>
 #include <unistd.h>
 #include "AudioOutputM5Speaker.h"
 #include <Avatar.h> // https://github.com/meganetaaan/m5stack-avatar
@@ -42,6 +43,14 @@
 
 #if USE_AVATAR && !defined(ARDUINO_M5Stack_ATOMS3)
   #define USE_SERVO
+#endif
+
+#ifndef SERVO_DEBUG_LOG
+  #if defined(DEBUG) || defined(_DEBUG)
+    #define SERVO_DEBUG_LOG 1
+  #else
+    #define SERVO_DEBUG_LOG 0
+  #endif
 #endif
 
 static constexpr size_t WAVE_SIZE = 320;
@@ -76,7 +85,8 @@ static constexpr size_t VBAN_AUDIO_BATCH_PACKETS = 2;
 static constexpr size_t VBAN_AUDIO_BATCH_SAMPLES_MAX = VBAN_OUTPUT_SAMPLES_MAX * VBAN_AUDIO_BATCH_PACKETS;
 static constexpr uint8_t VBAN_I2S_DMA_BUF_COUNT = 8;
 static constexpr uint16_t VBAN_I2S_DMA_BUF_LEN = 512;
-static constexpr uint32_t VBAN_GAP_RESYNC_THRESHOLD = 64;
+static constexpr esp_log_level_t VBAN_I2S_LOG_LEVEL_VALUE = static_cast<esp_log_level_t>(VBAN_I2S_LOG_LEVEL);
+static constexpr uint32_t VBAN_FRAME_RESYNC_THRESHOLD_MS = 250;
 static constexpr uint32_t VBAN_PLC_MAX_GAP_PACKETS = 2;
 static constexpr uint32_t VBAN_AUDIO_PACKET_WAIT_MS = 20;
 static constexpr UBaseType_t VBAN_RECEIVE_TASK_PRIORITY = 7;
@@ -129,6 +139,10 @@ static uint32_t resync_drop_count = 0;
 static uint32_t max_queued_packets = 0;
 static uint32_t current_vban_frame_delta = 0;
 static uint32_t max_vban_frame_delta = 0;
+static int32_t current_vban_frame_error = 0;
+static int32_t current_vban_frame_error_ms = 0;
+static uint32_t max_vban_frame_error_abs = 0;
+static uint32_t current_vban_frame_counter = 0;
 static uint32_t jitter_prime_count = 0;
 static uint32_t audio_write_fail_count = 0;
 static int audio_last_error = 0;
@@ -137,6 +151,7 @@ static uint32_t current_playback_sample_rate = VBAN_PLAYBACK_SAMPLE_RATE;
 static uint8_t current_channels = 0;
 static uint16_t current_frames_per_packet = 0;
 static uint32_t last_vban_frame = 0;
+static uint16_t last_vban_packet_frames = 0;
 static bool have_vban_frame = false;
 static volatile bool audio_primed = false;
 static bool avatar_started = false;
@@ -147,12 +162,36 @@ StackchanSystemConfig system_config;
 
 #ifdef USE_SERVO
 static constexpr uint32_t SERVO_MOVE_DURATION_MS = 500;
+static constexpr float SERVO_GAZE_X_GAIN_DEGREES = 20.0f;
+static constexpr float SERVO_GAZE_Y_DOWN_GAIN_DEGREES = 15.0f;
+static constexpr float SERVO_GAZE_Y_UP_GAIN_DEGREES = 10.0f;
 StackchanSERVO stackchanServo;
 #endif
 static fft_t fft;
 static int16_t raw_data[WAVE_SIZE * 2];
 static float lipsync_level_max = 10.0f;
 float mouth_ratio = 0.0f;
+
+static void configureI2SLogLevel()
+{
+  static constexpr const char* i2s_log_tags[] = {
+    "i2s",
+    "i2s_common",
+    "i2s_std",
+    "i2s_pdm",
+    "i2s_tdm",
+    "i2s_platform",
+    "i2s_dma",
+  };
+
+  for (const char* tag : i2s_log_tags) {
+    esp_log_level_set(tag, VBAN_I2S_LOG_LEVEL_VALUE);
+  }
+
+  if (VBAN_I2S_LOG_LEVEL >= ESP_LOG_INFO) {
+    M5_LOGI("I2S log level:%d", (int)VBAN_I2S_LOG_LEVEL_VALUE);
+  }
+}
 
 struct VBanHeader
 {
@@ -172,6 +211,19 @@ struct VbanAudioPacket
   uint32_t sample_rate;
   uint8_t channels;
   bool stereo;
+};
+
+struct VbanPacketTiming
+{
+  uint32_t frame_counter;
+  uint16_t frames_per_packet;
+  uint32_t sample_rate;
+};
+
+struct VbanFrameSyncResult
+{
+  bool accepted;
+  uint32_t missing_packets;
 };
 
 static VbanAudioPacket* packet_pool = nullptr;
@@ -261,7 +313,7 @@ static void connectWiFi(bool blocking)
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   esp_wifi_set_ps(WIFI_PS_NONE);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.setTxPower(WIFI_POWER_5dBm);
   WiFi.begin(wifi->ssid.c_str(), wifi->password.c_str());
   last_wifi_attempt_ms = millis();
 
@@ -456,6 +508,133 @@ static bool queueAudioPacket(VbanAudioPacket* packet)
   return false;
 }
 
+static uint32_t vbanResyncThresholdFrames(uint32_t sample_rate)
+{
+  return (static_cast<uint64_t>(sample_rate) * VBAN_FRAME_RESYNC_THRESHOLD_MS + 999ULL) / 1000ULL;
+}
+
+static uint32_t vbanResyncThresholdPackets(uint32_t sample_rate, uint16_t frames_per_packet)
+{
+  if (sample_rate == 0 || frames_per_packet == 0) return 1;
+  const uint32_t frames = vbanResyncThresholdFrames(sample_rate);
+  return (frames + frames_per_packet - 1) / frames_per_packet;
+}
+
+static int32_t vbanPacketsToMs(int64_t packets, uint16_t frames_per_packet, uint32_t sample_rate)
+{
+  if (sample_rate == 0) return 0;
+  const int64_t frames = packets * static_cast<int64_t>(frames_per_packet);
+  return static_cast<int32_t>((frames * 1000LL) / static_cast<int64_t>(sample_rate));
+}
+
+static VbanPacketTiming getVbanPacketTiming(const VBanHeader* hdr)
+{
+  return {
+    hdr->nuFrame,
+    static_cast<uint16_t>(hdr->format_nbs + 1),
+    VBanSRList[hdr->format_SR & VBAN_SR_MASK],
+  };
+}
+
+static void noteVbanFrameDelta(uint32_t delta)
+{
+  current_vban_frame_delta = delta;
+  if (delta > max_vban_frame_delta && delta < 0x80000000UL) {
+    max_vban_frame_delta = delta;
+  }
+}
+
+static void resetCurrentVbanFrameError()
+{
+  current_vban_frame_error = 0;
+  current_vban_frame_error_ms = 0;
+}
+
+static void noteVbanFrameError(int64_t packet_error, uint16_t frames_per_packet, uint32_t sample_rate)
+{
+  current_vban_frame_error = static_cast<int32_t>(packet_error);
+  current_vban_frame_error_ms = vbanPacketsToMs(packet_error, frames_per_packet, sample_rate);
+  const uint32_t packet_error_abs = packet_error < 0
+    ? static_cast<uint32_t>(-packet_error)
+    : static_cast<uint32_t>(packet_error);
+  if (packet_error_abs > max_vban_frame_error_abs) {
+    max_vban_frame_error_abs = packet_error_abs;
+  }
+}
+
+static void markVbanFrameOutOfOrder()
+{
+  ++packet_out_of_order_count;
+  ++dropped_packets;
+}
+
+static void resyncVbanAudioQueue()
+{
+  ++packet_resync_count;
+  flushAudioQueueForResync();
+  have_conceal_template = false;
+}
+
+static void commitVbanPacketTiming(const VbanPacketTiming& timing)
+{
+  have_vban_frame = true;
+  last_vban_frame = timing.frame_counter;
+  last_vban_packet_frames = timing.frames_per_packet;
+  current_vban_frame_counter = timing.frame_counter;
+}
+
+static VbanFrameSyncResult syncVbanFrameCounter(const VbanPacketTiming& timing)
+{
+  if (!have_vban_frame) {
+    commitVbanPacketTiming(timing);
+    return { true, 0 };
+  }
+
+  const uint32_t delta = timing.frame_counter - last_vban_frame;
+  const uint16_t expected_packet_frames = last_vban_packet_frames ? last_vban_packet_frames : timing.frames_per_packet;
+  const uint32_t resync_threshold_packets = vbanResyncThresholdPackets(timing.sample_rate, expected_packet_frames);
+  noteVbanFrameDelta(delta);
+  resetCurrentVbanFrameError();
+
+  if (delta == 0) {
+    markVbanFrameOutOfOrder();
+    return { false, 0 };
+  }
+
+  if (delta >= 0x80000000UL) {
+    const uint32_t backward_delta = last_vban_frame - timing.frame_counter;
+    if (!audio_primed &&
+        getQueuedAudioPackets() < VBAN_AUDIO_PREFILL &&
+        backward_delta > resync_threshold_packets) {
+      resyncVbanAudioQueue();
+      current_vban_frame_delta = 1;
+      commitVbanPacketTiming(timing);
+      return { true, 0 };
+    }
+
+    markVbanFrameOutOfOrder();
+    return { false, 0 };
+  }
+
+  const int64_t packet_error = static_cast<int64_t>(delta) - 1LL;
+  noteVbanFrameError(packet_error, expected_packet_frames, timing.sample_rate);
+  if (packet_error < 0) {
+    markVbanFrameOutOfOrder();
+    return { false, 0 };
+  }
+
+  uint32_t missing_packets = 0;
+  if (packet_error > static_cast<int64_t>(resync_threshold_packets)) {
+    resyncVbanAudioQueue();
+  } else if (packet_error > 0) {
+    missing_packets = static_cast<uint32_t>(packet_error);
+    packet_gap_count += missing_packets;
+  }
+
+  commitVbanPacketTiming(timing);
+  return { true, missing_packets };
+}
+
 static void enqueueConcealPackets(uint32_t missing_packets)
 {
   if (!have_conceal_template) return;
@@ -486,49 +665,13 @@ static void enqueueConcealPackets(uint32_t missing_packets)
   }
 }
 
-static void enqueueVbanPacket(const uint8_t* buffer, size_t size, const VBanHeader* hdr)
+static void enqueueVbanPacket(const uint8_t* buffer, const VBanHeader* hdr)
 {
   if (free_packet_queue == nullptr || audio_packet_queue == nullptr) return;
 
-  uint32_t missing_packets = 0;
-  if (have_vban_frame) {
-    uint32_t delta = hdr->nuFrame - last_vban_frame;
-    current_vban_frame_delta = delta;
-    if (delta > max_vban_frame_delta && delta < 0x80000000UL) {
-      max_vban_frame_delta = delta;
-    }
-    if (delta == 0) {
-      ++packet_out_of_order_count;
-      ++dropped_packets;
-      return;
-    }
-    if (delta >= 0x80000000UL) {
-      const uint32_t backward_delta = last_vban_frame - hdr->nuFrame;
-      if (!audio_primed &&
-          getQueuedAudioPackets() < VBAN_AUDIO_PREFILL &&
-          backward_delta > VBAN_GAP_RESYNC_THRESHOLD) {
-        ++packet_resync_count;
-        flushAudioQueueForResync();
-        have_conceal_template = false;
-        current_vban_frame_delta = 1;
-      } else {
-        ++packet_out_of_order_count;
-        ++dropped_packets;
-        return;
-      }
-    } else if (delta > VBAN_GAP_RESYNC_THRESHOLD) {
-      ++packet_resync_count;
-      flushAudioQueueForResync();
-      have_conceal_template = false;
-    } else if (delta > 1) {
-      missing_packets = delta - 1;
-      packet_gap_count += missing_packets;
-    }
-  } else {
-    have_vban_frame = true;
-  }
-  last_vban_frame = hdr->nuFrame;
-  enqueueConcealPackets(missing_packets);
+  const VbanFrameSyncResult sync = syncVbanFrameCounter(getVbanPacketTiming(hdr));
+  if (!sync.accepted) return;
+  enqueueConcealPackets(sync.missing_packets);
 
   VbanAudioPacket* packet = acquireAudioPacket();
   if (packet == nullptr) {
@@ -565,7 +708,7 @@ static bool receiveVban()
 
   const VBanHeader* hdr = nullptr;
   if (read_size > 0 && validateVbanPacket(vban_buffer, read_size, &hdr)) {
-    enqueueVbanPacket(vban_buffer, read_size, hdr);
+    enqueueVbanPacket(vban_buffer, hdr);
   } else {
     ++dropped_packets;
   }
@@ -710,6 +853,21 @@ void lipSync(void *args)
   }
 }
 
+#ifdef USE_SERVO
+static int gazeToServoOffset(float gaze, float gain_degrees)
+{
+  const float clamped_gaze = constrain(gaze, -1.0f, 1.0f);
+  const float offset = gain_degrees * clamped_gaze;
+  return (int)(offset + (offset >= 0.0f ? 0.5f : -0.5f));
+}
+
+static void centerAvatarGaze()
+{
+  avatar.setRightGaze(0.0f, 0.0f);
+  avatar.setLeftGaze(0.0f, 0.0f);
+}
+#endif
+
 void servo(void *args)
 {
   float gazeX, gazeY;
@@ -719,17 +877,18 @@ void servo(void *args)
   {
 #ifdef USE_SERVO
     avatar->getGaze(&gazeY, &gazeX);
-    int servoX = system_config.getServoInfo(AXIS_X)->start_degree + (int)(20.0 * gazeX);
+    int servoX = system_config.getServoInfo(AXIS_X)->start_degree + gazeToServoOffset(gazeX, SERVO_GAZE_X_GAIN_DEGREES);
     int servoY = system_config.getServoInfo(AXIS_Y)->start_degree;
-    if (gazeY < 0) {
-      int tmp = (int)(15.0 * gazeY);
-      if (tmp > 15) tmp = 15;
-      servoY += tmp;
+    if (gazeY < 0.0f) {
+      servoY += gazeToServoOffset(gazeY, SERVO_GAZE_Y_DOWN_GAIN_DEGREES);
     } else {
-      servoY += (int)(10.0 * gazeY);
+      servoY += gazeToServoOffset(gazeY, SERVO_GAZE_Y_UP_GAIN_DEGREES);
     }
     servoX = constrain(servoX, system_config.getServoInfo(AXIS_X)->lower_limit, system_config.getServoInfo(AXIS_X)->upper_limit);
     servoY = constrain(servoY, system_config.getServoInfo(AXIS_Y)->lower_limit, system_config.getServoInfo(AXIS_Y)->upper_limit);
+#if SERVO_DEBUG_LOG
+    M5_LOGI("Servo gaze x:%d y:%d -> X:%d Y:%d", (int)(gazeX * 100.0f), (int)(gazeY * 100.0f), servoX, servoY);
+#endif
     stackchanServo.moveXY(servoX, servoY, SERVO_MOVE_DURATION_MS);
 #endif
     delay(5000);
@@ -820,6 +979,88 @@ static void configureAvatarLayout()
   }
 }
 
+struct VbanStatusMetrics
+{
+  float packet_rate;
+  float expected_packet_rate;
+  float frame_counter_audio_rate;
+  float effective_audio_rate;
+  float frame_clock_drift_ms;
+  unsigned queued_packets;
+  float buffer_ms;
+};
+
+static VbanStatusMetrics collectVbanStatusMetrics()
+{
+  static uint32_t last_ok = 0;
+  static uint32_t last_plc = 0;
+  static uint32_t last_ms = 0;
+  static uint32_t last_frame_counter = 0;
+  static bool have_last_frame_counter = false;
+
+  const uint32_t now = millis();
+  const uint32_t delta_ms = last_ms ? now - last_ms : 0;
+  const uint32_t delta_ok = valid_packets - last_ok;
+  const uint32_t delta_plc = packet_conceal_count - last_plc;
+  uint32_t frame_counter_delta = 0;
+  if (have_last_frame_counter) {
+    frame_counter_delta = current_vban_frame_counter - last_frame_counter;
+    if (frame_counter_delta >= 0x80000000UL) {
+      frame_counter_delta = 0;
+    }
+  }
+
+  const uint64_t audio_frame_delta = static_cast<uint64_t>(frame_counter_delta) * current_frames_per_packet;
+  const float packet_rate = delta_ms ? (delta_ok * 1000.0f / delta_ms) : 0.0f;
+  const float expected_packet_rate = current_frames_per_packet
+    ? (current_sample_rate / static_cast<float>(current_frames_per_packet))
+    : 0.0f;
+  const float frame_counter_audio_rate = (delta_ms && audio_frame_delta)
+    ? (audio_frame_delta * 1000.0f / delta_ms)
+    : 0.0f;
+  const float effective_audio_rate = delta_ms
+    ? ((delta_ok + delta_plc) * 1000.0f / delta_ms * current_frames_per_packet)
+    : 0.0f;
+  const float frame_clock_drift_ms = (delta_ms && current_sample_rate && audio_frame_delta)
+    ? ((audio_frame_delta * 1000.0f / current_sample_rate) - delta_ms)
+    : 0.0f;
+  const unsigned queued_packets = getQueuedAudioPackets();
+  noteQueuedAudioPackets(queued_packets);
+  const float buffer_ms = (current_frames_per_packet && current_playback_sample_rate)
+    ? (queued_packets * current_frames_per_packet * 1000.0f / current_playback_sample_rate)
+    : 0.0f;
+
+  last_ms = now;
+  last_ok = valid_packets;
+  last_plc = packet_conceal_count;
+  last_frame_counter = current_vban_frame_counter;
+  have_last_frame_counter = have_vban_frame;
+
+  return {
+    packet_rate,
+    expected_packet_rate,
+    frame_counter_audio_rate,
+    effective_audio_rate,
+    frame_clock_drift_ms,
+    queued_packets,
+    buffer_ms,
+  };
+}
+
+static void logVbanStatus(const VbanStatusMetrics& metrics)
+{
+  M5_LOGI("VBAN %s:%u %s %luHz play:%luHz %uch frames:%u ok:%lu drop:%lu driftDrop:%lu resyncDrop:%lu gap:%lu plc:%lu ooo:%lu resync:%lu nu:%lu maxNu:%lu frameErr:%ld frameErrMs:%ld maxFrameErr:%lu underrun:%lu prime:%lu queued:%u maxQ:%lu bufMs:%.1f i2s:%d/%d/%d amp:%u i2sFail:%lu i2sErr:%d pps:%.1f needPps:%.1f fcHz:%.1f effHz:%.1f fcDriftMs:%.1f",
+          WiFi.localIP().toString().c_str(), VBAN_PORT, VBAN_STREAM_NAME,
+          current_sample_rate, current_playback_sample_rate, current_channels, current_frames_per_packet, valid_packets, dropped_packets, drift_drop_count, resync_drop_count,
+          packet_gap_count, packet_conceal_count, packet_out_of_order_count, packet_resync_count,
+          current_vban_frame_delta, max_vban_frame_delta,
+          (long)current_vban_frame_error, (long)current_vban_frame_error_ms, max_vban_frame_error_abs,
+          underrun_count, jitter_prime_count, metrics.queued_packets, max_queued_packets, metrics.buffer_ms,
+          out.getBckPin(), out.getWsPin(), out.getDataOutPin(), out.isAmpEnabled(),
+          audio_write_fail_count, audio_last_error, metrics.packet_rate, metrics.expected_packet_rate,
+          metrics.frame_counter_audio_rate, metrics.effective_audio_rate, metrics.frame_clock_drift_ms);
+}
+
 static void updateStatus()
 {
   if (millis() - last_status_ms < STATUS_INTERVAL_MS) return;
@@ -829,37 +1070,10 @@ static void updateStatus()
 
   if (WiFi.status() == WL_CONNECTED) {
     static uint32_t last_log_ms = 0;
-    static uint32_t last_ok = 0;
-    static uint32_t last_plc = 0;
-    static uint32_t last_ms = 0;
     if (millis() - last_log_ms >= 5000) {
-      uint32_t now = millis();
-      uint32_t delta_ms = last_ms ? now - last_ms : 0;
-      uint32_t delta_ok = valid_packets - last_ok;
-      uint32_t delta_plc = packet_conceal_count - last_plc;
-      float packet_rate = delta_ms ? (delta_ok * 1000.0f / delta_ms) : 0.0f;
-      float expected_packet_rate = current_frames_per_packet
-        ? (current_sample_rate / static_cast<float>(current_frames_per_packet))
-        : 0.0f;
-      float audio_rate = packet_rate * current_frames_per_packet;
-      float effective_audio_rate = delta_ms ? ((delta_ok + delta_plc) * 1000.0f / delta_ms * current_frames_per_packet) : 0.0f;
-      unsigned queued_packets = getQueuedAudioPackets();
-      noteQueuedAudioPackets(queued_packets);
-      float buffer_ms = (current_frames_per_packet && current_playback_sample_rate)
-        ? (queued_packets * current_frames_per_packet * 1000.0f / current_playback_sample_rate)
-        : 0.0f;
-      last_ms = now;
-      last_ok = valid_packets;
-      last_plc = packet_conceal_count;
+      const VbanStatusMetrics metrics = collectVbanStatusMetrics();
       last_log_ms = millis();
-      M5_LOGI("VBAN %s:%u %s %luHz play:%luHz %uch frames:%u ok:%lu drop:%lu driftDrop:%lu resyncDrop:%lu gap:%lu plc:%lu ooo:%lu resync:%lu nu:%lu maxNu:%lu underrun:%lu prime:%lu queued:%u maxQ:%lu bufMs:%.1f i2s:%d/%d/%d amp:%u i2sFail:%lu i2sErr:%d pps:%.1f needPps:%.1f audioHz:%.1f effHz:%.1f",
-              WiFi.localIP().toString().c_str(), VBAN_PORT, VBAN_STREAM_NAME,
-              current_sample_rate, current_playback_sample_rate, current_channels, current_frames_per_packet, valid_packets, dropped_packets, drift_drop_count, resync_drop_count,
-              packet_gap_count, packet_conceal_count, packet_out_of_order_count, packet_resync_count,
-              current_vban_frame_delta, max_vban_frame_delta,
-              underrun_count, jitter_prime_count, queued_packets, max_queued_packets, buffer_ms,
-              out.getBckPin(), out.getWsPin(), out.getDataOutPin(), out.isAmpEnabled(),
-              audio_write_fail_count, audio_last_error, packet_rate, expected_packet_rate, audio_rate, effective_audio_rate);
+      logVbanStatus(metrics);
     }
   }
 }
@@ -873,6 +1087,7 @@ void setup()
 
   M5.begin(cfg);
   M5.Log.setLogLevel(m5::log_target_serial, ESP_LOG_INFO);
+  configureI2SLogLevel();
   M5_LOGI("M5Unified Stack-chan VBAN receiver starting");
 #if defined(ARDUINO_M5STACK_CORES3)
   unifiedButton.begin(&M5.Display, goblib::UnifiedButton::appearance_t::transparent_all);
@@ -905,15 +1120,21 @@ void setup()
 #endif
 
   auto active_spk_cfg = M5.Speaker.config();
-  M5_LOGI("Direct I2S config port:%d bck:%d ws:%d data:%d mck:%d dma:%u/%u",
-          active_spk_cfg.i2s_port, active_spk_cfg.pin_bck, active_spk_cfg.pin_ws,
-          active_spk_cfg.pin_data_out, active_spk_cfg.pin_mck,
-          (unsigned)active_spk_cfg.dma_buf_count, (unsigned)active_spk_cfg.dma_buf_len);
+  if (VBAN_I2S_LOG_LEVEL >= ESP_LOG_INFO) {
+    M5_LOGI("Direct I2S config port:%d bck:%d ws:%d data:%d mck:%d dma:%u/%u",
+            active_spk_cfg.i2s_port, active_spk_cfg.pin_bck, active_spk_cfg.pin_ws,
+            active_spk_cfg.pin_data_out, active_spk_cfg.pin_mck,
+            (unsigned)active_spk_cfg.dma_buf_count, (unsigned)active_spk_cfg.dma_buf_len);
+  }
   if (!out.begin(active_spk_cfg, VBAN_PLAYBACK_SAMPLE_RATE)) {
-    M5_LOGE("Failed to initialize direct I2S audio output");
+    if (VBAN_I2S_LOG_LEVEL >= ESP_LOG_ERROR) {
+      M5_LOGE("Failed to initialize direct I2S audio output");
+    }
   } else {
-    M5_LOGI("Direct I2S audio output initialized port:%d bck:%d ws:%d data:%d amp:%u",
-            out.getPort(), out.getBckPin(), out.getWsPin(), out.getDataOutPin(), out.isAmpEnabled());
+    if (VBAN_I2S_LOG_LEVEL >= ESP_LOG_INFO) {
+      M5_LOGI("Direct I2S audio output initialized port:%d bck:%d ws:%d data:%d amp:%u",
+              out.getPort(), out.getBckPin(), out.getWsPin(), out.getDataOutPin(), out.isAmpEnabled());
+    }
   }
   initAudioQueues();
   const uint8_t start_volume = system_config.getBluetoothSetting()->start_volume;
@@ -937,10 +1158,13 @@ void setup()
   if (USE_AVATAR) {
     configureAvatarLayout();
     avatar.init();
+#ifdef USE_SERVO
+    centerAvatarGaze();
+#endif
     avatar_started = true;
     avatar.addTask(lipSync, "lipSync");
 #ifdef USE_SERVO
-    avatar.addTask(servo, "servo");
+    avatar.addTask(servo, "servo", 4096);
 #endif
   }
 

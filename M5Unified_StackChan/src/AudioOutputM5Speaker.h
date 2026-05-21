@@ -1,6 +1,11 @@
 /// set M5Speaker virtual channel (0-7)
 #include <driver/i2s.h>
+#include <esp_log.h>
 #include <M5Unified.h>
+
+#ifndef VBAN_I2S_LOG_LEVEL
+  #define VBAN_I2S_LOG_LEVEL ESP_LOG_INFO
+#endif
 
 static constexpr uint8_t m5spk_virtual_channel = 0;
 
@@ -71,10 +76,12 @@ class AudioOutputM5Speaker
  #endif
 #endif
 
-      M5_LOGI("Direct I2S effective port:%d bck:%d ws:%d data:%d mck:%d dma:%u/%u rate:%lu",
-              _i2s_port, _pin_bck, _pin_ws, _pin_data_out, _pin_mck,
-              (unsigned)effective_config.dma_buf_count, (unsigned)effective_config.dma_buf_len,
-              sample_rate);
+      if (VBAN_I2S_LOG_LEVEL >= ESP_LOG_INFO) {
+        M5_LOGI("Direct I2S effective port:%d bck:%d ws:%d data:%d mck:%d dma:%u/%u rate:%lu",
+                _i2s_port, _pin_bck, _pin_ws, _pin_data_out, _pin_mck,
+                (unsigned)effective_config.dma_buf_count, (unsigned)effective_config.dma_buf_len,
+                sample_rate);
+      }
       _last_error = i2s_driver_install(_i2s_port, &i2s_config, 0, nullptr);
       if (_last_error != ESP_OK) {
         return false;
