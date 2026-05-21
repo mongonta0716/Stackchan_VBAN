@@ -79,7 +79,7 @@ static constexpr uint16_t VBAN_I2S_DMA_BUF_LEN = 512;
 static constexpr uint32_t VBAN_GAP_RESYNC_THRESHOLD = 64;
 static constexpr uint32_t VBAN_PLC_MAX_GAP_PACKETS = 2;
 static constexpr uint32_t VBAN_AUDIO_PACKET_WAIT_MS = 20;
-static constexpr UBaseType_t VBAN_RECEIVE_TASK_PRIORITY = 4;
+static constexpr UBaseType_t VBAN_RECEIVE_TASK_PRIORITY = 7;
 static constexpr UBaseType_t VBAN_AUDIO_TASK_PRIORITY = 6;
 #if defined(USE_ATOMIC_ECHO_BASE)
 static constexpr uint32_t VBAN_PLAYBACK_SAMPLE_RATE = 48000;
@@ -112,6 +112,7 @@ static bool udp_started = false;
 static bool sd_ready = false;
 #if defined(USE_ATOMIC_ECHO_BASE)
 static bool spiffs_ready = false;
+static bool echobase_ready = false;
 #endif
 static uint32_t last_wifi_attempt_ms = 0;
 static uint32_t last_status_ms = 0;
@@ -366,9 +367,8 @@ static bool buildAudioPacket(const uint8_t* buffer, const VBanHeader* hdr, VbanA
   } else {
     const int16_t* in = payload;
     for (uint16_t i = 0; i < frames; ++i) {
-      const int16_t mono = static_cast<int16_t>((static_cast<int32_t>(in[0]) + in[1]) >> 1);
-      *out_samples++ = mono;
-      *out_samples++ = mono;
+      *out_samples++ = in[0];
+      *out_samples++ = in[1];
       in += channels;
     }
   }
@@ -557,10 +557,7 @@ static bool receiveVban()
 {
   if (!udp_started || udp_socket_fd < 0) return false;
 
-  sockaddr_in source_addr = {};
-  socklen_t source_addr_len = sizeof(source_addr);
-  int read_size = recvfrom(udp_socket_fd, vban_buffer, sizeof(vban_buffer), 0,
-                           reinterpret_cast<sockaddr*>(&source_addr), &source_addr_len);
+  int read_size = recv(udp_socket_fd, vban_buffer, sizeof(vban_buffer), 0);
   if (read_size < 0) {
     ++dropped_packets;
     return true;
@@ -787,13 +784,24 @@ static void initConfigStorage()
 }
 
 #if defined(USE_ATOMIC_ECHO_BASE)
-static void initEchoBase(uint8_t volume)
+static bool initEchoBase(uint8_t volume)
 {
-  echobase.init(VBAN_PLAYBACK_SAMPLE_RATE, ECHOBASE_I2C_SDA, ECHOBASE_I2C_SCL,
-                ECHOBASE_I2S_DIN, ECHOBASE_I2S_WS, ECHOBASE_I2S_DOUT,
-                ECHOBASE_I2S_BCK, Wire);
+  if (!echobase.init(VBAN_PLAYBACK_SAMPLE_RATE, ECHOBASE_I2C_SDA, ECHOBASE_I2C_SCL,
+                     ECHOBASE_I2S_DIN, ECHOBASE_I2S_WS, ECHOBASE_I2S_DOUT,
+                     ECHOBASE_I2S_BCK, Wire)) {
+    M5_LOGE("Failed to initialize Atomic Echo Base");
+    return false;
+  }
   echobase.setSpeakerVolume(map(volume, 0, 255, 0, 100));
   echobase.setMicGain(ES8311_MIC_GAIN_6DB);
+  return true;
+}
+
+static void applyEchoBaseOutputSettings(uint8_t volume)
+{
+  if (!echobase_ready) return;
+  echobase.setMute(false);
+  echobase.setSpeakerVolume(map(volume, 0, 255, 0, 100));
 }
 #endif
 
@@ -830,6 +838,9 @@ static void updateStatus()
       uint32_t delta_ok = valid_packets - last_ok;
       uint32_t delta_plc = packet_conceal_count - last_plc;
       float packet_rate = delta_ms ? (delta_ok * 1000.0f / delta_ms) : 0.0f;
+      float expected_packet_rate = current_frames_per_packet
+        ? (current_sample_rate / static_cast<float>(current_frames_per_packet))
+        : 0.0f;
       float audio_rate = packet_rate * current_frames_per_packet;
       float effective_audio_rate = delta_ms ? ((delta_ok + delta_plc) * 1000.0f / delta_ms * current_frames_per_packet) : 0.0f;
       unsigned queued_packets = getQueuedAudioPackets();
@@ -841,14 +852,14 @@ static void updateStatus()
       last_ok = valid_packets;
       last_plc = packet_conceal_count;
       last_log_ms = millis();
-      M5_LOGI("VBAN %s:%u %s %luHz play:%luHz %uch frames:%u ok:%lu drop:%lu driftDrop:%lu resyncDrop:%lu gap:%lu plc:%lu ooo:%lu resync:%lu nu:%lu maxNu:%lu underrun:%lu prime:%lu queued:%u maxQ:%lu bufMs:%.1f i2s:%d/%d/%d amp:%u i2sFail:%lu i2sErr:%d pps:%.1f audioHz:%.1f effHz:%.1f",
+      M5_LOGI("VBAN %s:%u %s %luHz play:%luHz %uch frames:%u ok:%lu drop:%lu driftDrop:%lu resyncDrop:%lu gap:%lu plc:%lu ooo:%lu resync:%lu nu:%lu maxNu:%lu underrun:%lu prime:%lu queued:%u maxQ:%lu bufMs:%.1f i2s:%d/%d/%d amp:%u i2sFail:%lu i2sErr:%d pps:%.1f needPps:%.1f audioHz:%.1f effHz:%.1f",
               WiFi.localIP().toString().c_str(), VBAN_PORT, VBAN_STREAM_NAME,
               current_sample_rate, current_playback_sample_rate, current_channels, current_frames_per_packet, valid_packets, dropped_packets, drift_drop_count, resync_drop_count,
               packet_gap_count, packet_conceal_count, packet_out_of_order_count, packet_resync_count,
               current_vban_frame_delta, max_vban_frame_delta,
               underrun_count, jitter_prime_count, queued_packets, max_queued_packets, buffer_ms,
               out.getBckPin(), out.getWsPin(), out.getDataOutPin(), out.isAmpEnabled(),
-              audio_write_fail_count, audio_last_error, packet_rate, audio_rate, effective_audio_rate);
+              audio_write_fail_count, audio_last_error, packet_rate, expected_packet_rate, audio_rate, effective_audio_rate);
     }
   }
 }
@@ -886,6 +897,13 @@ void setup()
   M5.Display.clear();
   M5.Display.setCursor(0, 0);
   M5.Display.setTextSize(2);
+
+  initConfigStorage();
+  config_read();
+#if defined(USE_ATOMIC_ECHO_BASE)
+  echobase_ready = initEchoBase(system_config.getBluetoothSetting()->start_volume);
+#endif
+
   auto active_spk_cfg = M5.Speaker.config();
   M5_LOGI("Direct I2S config port:%d bck:%d ws:%d data:%d mck:%d dma:%u/%u",
           active_spk_cfg.i2s_port, active_spk_cfg.pin_bck, active_spk_cfg.pin_ws,
@@ -898,16 +916,14 @@ void setup()
             out.getPort(), out.getBckPin(), out.getWsPin(), out.getDataOutPin(), out.isAmpEnabled());
   }
   initAudioQueues();
-
-  initConfigStorage();
-  config_read();
+  const uint8_t start_volume = system_config.getBluetoothSetting()->start_volume;
 #if defined(USE_ATOMIC_ECHO_BASE)
-  initEchoBase(system_config.getBluetoothSetting()->start_volume);
+  applyEchoBaseOutputSettings(start_volume);
 #endif
-  M5.Speaker.setChannelVolume(m5spk_virtual_channel, system_config.getBluetoothSetting()->start_volume);
-  M5.Speaker.setVolume(system_config.getBluetoothSetting()->start_volume);
-  out.setVolume(system_config.getBluetoothSetting()->start_volume);
-  M5_LOGI("Audio volume:%u", system_config.getBluetoothSetting()->start_volume);
+  M5.Speaker.setChannelVolume(m5spk_virtual_channel, start_volume);
+  M5.Speaker.setVolume(start_volume);
+  out.setVolume(start_volume);
+  M5_LOGI("Audio volume:%u", start_volume);
 
   if (USE_AVATAR) {
     Servo_setup();

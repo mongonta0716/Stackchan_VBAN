@@ -136,8 +136,8 @@ class AudioOutputM5Speaker
       }
       size_t write_bytes = 0;
       const size_t frame_count = stereo ? ((copy_count + 1) / 2) : copy_count;
-      uint32_t timeout_ms = _sample_rate ? (static_cast<uint32_t>(frame_count) * 1000U / _sample_rate) + 5U : 20U;
-      if (timeout_ms < 10U) timeout_ms = 10U;
+      uint32_t timeout_ms = _sample_rate ? (static_cast<uint32_t>(frame_count) * 1000U / _sample_rate) + 20U : 40U;
+      if (timeout_ms < 25U) timeout_ms = 25U;
       TickType_t write_timeout = pdMS_TO_TICKS(timeout_ms);
       if (write_timeout == 0) write_timeout = 1;
       esp_err_t err = i2s_write(_i2s_port, _tri_buffer[_tri_index], copy_count * sizeof(int16_t), &write_bytes, write_timeout);
