@@ -12,13 +12,6 @@ static constexpr uint8_t m5spk_virtual_channel = 0;
 class AudioOutputM5Speaker
 {
   public:
-    AudioOutputM5Speaker(m5::Speaker_Class* m5sound, uint8_t virtual_sound_channel = 0)
-    {
-      _m5sound = m5sound;
-      _virtual_ch = virtual_sound_channel;
-    }
-    virtual ~AudioOutputM5Speaker(void) {};
-
     bool begin(const m5::speaker_config_t& speaker_config, uint32_t sample_rate)
     {
       _sample_rate = sample_rate;
@@ -94,24 +87,12 @@ class AudioOutputM5Speaker
       i2s_zero_dma_buffer(_i2s_port);
       _last_error = i2s_start(_i2s_port);
       enableAmp(effective_config, sample_rate);
-      _started = true;
       return true;
     }
 
     void setVolume(uint8_t volume)
     {
       _volume = volume;
-    }
-
-    bool stop(void)
-    {
-      i2s_zero_dma_buffer(_i2s_port);
-      for (size_t i = 0; i < tri_buffer_count; ++i)
-      {
-        memset(_tri_buffer[i], 0, tri_buf_size * sizeof(int16_t));
-      }
-      ++_update_count;
-      return true;
     }
 
     bool playPcm16(const int16_t* samples, size_t sample_count, uint32_t sample_rate, bool stereo)
@@ -168,11 +149,8 @@ class AudioOutputM5Speaker
     int getWsPin(void) const { return _pin_ws; }
     int getDataOutPin(void) const { return _pin_data_out; }
     bool isAmpEnabled(void) const { return _amp_enabled; }
-    bool isStarted(void) const { return _started; }
 
   protected:
-    m5::Speaker_Class* _m5sound;
-    uint8_t _virtual_ch;
 #if defined(USE_ATOMIC_ECHO_BASE)
     i2s_port_t _i2s_port = I2S_NUM_0;
 #elif defined(ARDUINO_M5STACK_CORES3)
@@ -182,7 +160,6 @@ class AudioOutputM5Speaker
 #endif
     uint32_t _sample_rate = 0;
     uint8_t _volume = 255;
-    bool _started = false;
     bool _amp_enabled = false;
     int _pin_bck = I2S_PIN_NO_CHANGE;
     int _pin_ws = I2S_PIN_NO_CHANGE;

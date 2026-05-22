@@ -83,19 +83,21 @@ static constexpr size_t VBAN_AUDIO_DRIFT_DROP_TARGET = VBAN_AUDIO_PREFILL + 4;
 static constexpr size_t VBAN_AUDIO_DRIFT_DROP_BURST_MAX = 2;
 static constexpr size_t VBAN_AUDIO_BATCH_PACKETS = 2;
 static constexpr size_t VBAN_AUDIO_BATCH_SAMPLES_MAX = VBAN_OUTPUT_SAMPLES_MAX * VBAN_AUDIO_BATCH_PACKETS;
+#if defined(USE_ATOMIC_ECHO_BASE)
+static constexpr uint8_t VBAN_I2S_DMA_BUF_COUNT = 16;
+static constexpr uint16_t VBAN_I2S_DMA_BUF_LEN = 256;
+#else
 static constexpr uint8_t VBAN_I2S_DMA_BUF_COUNT = 8;
 static constexpr uint16_t VBAN_I2S_DMA_BUF_LEN = 512;
+#endif
 static constexpr esp_log_level_t VBAN_I2S_LOG_LEVEL_VALUE = static_cast<esp_log_level_t>(VBAN_I2S_LOG_LEVEL);
+
 static constexpr uint32_t VBAN_FRAME_RESYNC_THRESHOLD_MS = 250;
 static constexpr uint32_t VBAN_PLC_MAX_GAP_PACKETS = 2;
 static constexpr uint32_t VBAN_AUDIO_PACKET_WAIT_MS = 20;
 static constexpr UBaseType_t VBAN_RECEIVE_TASK_PRIORITY = 7;
 static constexpr UBaseType_t VBAN_AUDIO_TASK_PRIORITY = 6;
-#if defined(USE_ATOMIC_ECHO_BASE)
 static constexpr uint32_t VBAN_PLAYBACK_SAMPLE_RATE = 48000;
-#else
-static constexpr uint32_t VBAN_PLAYBACK_SAMPLE_RATE = 48000;
-#endif
 
 #if defined(USE_ATOMIC_ECHO_BASE)
 static constexpr int ECHOBASE_I2C_SDA = 38;
@@ -111,7 +113,7 @@ static M5EchoBase echobase(I2S_NUM_0);
 #endif
 #endif
 
-static AudioOutputM5Speaker out(&M5.Speaker, m5spk_virtual_channel);
+static AudioOutputM5Speaker out;
 static int udp_socket_fd = -1;
 static uint8_t vban_buffer[VBAN_PROTOCOL_MAX_SIZE];
 static int16_t playback_batch[VBAN_AUDIO_BATCH_SAMPLES_MAX];
@@ -126,7 +128,6 @@ static bool echobase_ready = false;
 #endif
 static uint32_t last_wifi_attempt_ms = 0;
 static uint32_t last_status_ms = 0;
-static uint32_t last_packet_ms = 0;
 static uint32_t valid_packets = 0;
 static uint32_t dropped_packets = 0;
 static uint32_t underrun_count = 0;
@@ -313,7 +314,7 @@ static void connectWiFi(bool blocking)
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   esp_wifi_set_ps(WIFI_PS_NONE);
-  WiFi.setTxPower(WIFI_POWER_5dBm);
+  WiFi.setTxPower(WIFI_POWER_15dBm);
   WiFi.begin(wifi->ssid.c_str(), wifi->password.c_str());
   last_wifi_attempt_ms = millis();
 
@@ -688,7 +689,6 @@ static void enqueueVbanPacket(const uint8_t* buffer, const VBanHeader* hdr)
   current_sample_rate = packet->sample_rate;
   current_channels = packet->channels;
   current_frames_per_packet = packet->sample_count / VBAN_OUTPUT_CHANNELS;
-  last_packet_ms = millis();
   if (queueAudioPacket(packet)) {
     conceal_template = *packet;
     have_conceal_template = true;
