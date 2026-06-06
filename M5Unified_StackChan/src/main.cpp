@@ -171,6 +171,7 @@ StackchanSERVO stackchanServo;
 static fft_t fft;
 static int16_t raw_data[WAVE_SIZE * 2];
 static float lipsync_level_max = 10.0f;
+static constexpr float LIPSYNC_RESPONSE_GAIN = 2.0f;
 float mouth_ratio = 0.0f;
 
 static void configureI2SLogLevel()
@@ -840,7 +841,7 @@ void lipSync(void *args)
       }
     }
 
-    mouth_ratio = (float)(level >> 16) / lipsync_level_max;
+    mouth_ratio = ((float)(level >> 16) / lipsync_level_max) * LIPSYNC_RESPONSE_GAIN;
     if (mouth_ratio > 1.2f) {
       if (mouth_ratio > 1.5f) {
         lipsync_level_max += 10.0f;
