@@ -15,9 +15,15 @@
 #include <esp_log.h>
 #include <unistd.h>
 #include "AudioOutputM5Speaker.h"
+#include "Stackchan_vban_config.h"
 #include <Avatar.h> // https://github.com/meganetaaan/m5stack-avatar
-#include <Stackchan_system_config.h> // https://github.com/stack-chan/stackchan-arduino
 #include <Stackchan_servo.h> // https://github.com/stack-chan/stackchan-arduino
+#ifndef USE_NECOMIMI_LED
+  #define USE_NECOMIMI_LED 1
+#endif
+#if USE_NECOMIMI_LED
+  #include <FastLED.h>
+#endif
 #if defined(ARDUINO_M5STACK_CORES3)
   #include <gob_unifiedButton.hpp>
   goblib::UnifiedButton unifiedButton;
@@ -55,11 +61,12 @@
 
 static constexpr size_t WAVE_SIZE = 320;
 static constexpr int SD_SPI_FREQUENCY = 10000000;
-static constexpr TickType_t LIPSYNC_INTERVAL_TICKS = pdMS_TO_TICKS(150);
+static constexpr TickType_t LIPSYNC_INTERVAL_TICKS = pdMS_TO_TICKS(100);
 static constexpr uint16_t VBAN_PORT = 6980;
 static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 static constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 5000;
 static constexpr uint32_t WIFI_IP_DISPLAY_MS = 5000;
+static constexpr const char* VBAN_EXT_CONFIG_FILENAME = "/SC_VBAN/SC_ExtConfig.yaml";
 static constexpr uint32_t STATUS_INTERVAL_MS = 1000;
 static constexpr uint8_t VBAN_HEADER_SIZE = 28;
 static constexpr size_t VBAN_PROTOCOL_MAX_SIZE = 1464;
@@ -98,6 +105,16 @@ static constexpr uint32_t VBAN_AUDIO_PACKET_WAIT_MS = 20;
 static constexpr UBaseType_t VBAN_RECEIVE_TASK_PRIORITY = 7;
 static constexpr UBaseType_t VBAN_AUDIO_TASK_PRIORITY = 6;
 static constexpr uint32_t VBAN_PLAYBACK_SAMPLE_RATE = 48000;
+
+#if USE_NECOMIMI_LED
+#ifndef NECOMIMI_LED_GPIO
+  #define NECOMIMI_LED_GPIO 9
+#endif
+static constexpr uint8_t NECOMIMI_LED_COUNT = 18;
+static constexpr uint8_t NECOMIMI_LED_SIDE_COUNT = NECOMIMI_LED_COUNT / 2;
+static constexpr uint8_t NECOMIMI_LED_LEVELS = 5;
+static constexpr uint8_t NECOMIMI_LED_BRIGHTNESS = 10;
+#endif
 
 #if defined(USE_ATOMIC_ECHO_BASE)
 static constexpr int ECHOBASE_I2C_SDA = 38;
@@ -159,7 +176,7 @@ static bool avatar_started = false;
 
 using namespace m5avatar;
 Avatar avatar;
-StackchanSystemConfig system_config;
+StackchanVbanConfig system_config;
 
 #ifdef USE_SERVO
 static constexpr uint32_t SERVO_MOVE_DURATION_MS = 500;
@@ -173,6 +190,78 @@ static int16_t raw_data[WAVE_SIZE * 2];
 static float lipsync_level_max = 10.0f;
 static constexpr float LIPSYNC_RESPONSE_GAIN = 2.0f;
 float mouth_ratio = 0.0f;
+
+#if USE_NECOMIMI_LED
+static CRGB necomimi_leds[NECOMIMI_LED_COUNT];
+static constexpr CRGB::HTMLColorCode NECOMIMI_LED_COLORS[NECOMIMI_LED_SIDE_COUNT] = {
+  CRGB::Purple,
+  CRGB::Blue,
+  CRGB::Green,
+  CRGB::Yellow,
+  CRGB::Red,
+  CRGB::Red,
+  CRGB::Red,
+  CRGB::Red,
+  CRGB::Red,
+};
+static constexpr uint8_t NECOMIMI_LED_STAGE_PIXELS[NECOMIMI_LED_LEVELS + 1] = {
+  0, 1, 2, 3, 4, 5,
+};
+static uint8_t necomimi_led_last_level = 255;
+
+static void clearNecomimiLedBuffer()
+{
+  for (uint8_t i = 0; i < NECOMIMI_LED_COUNT; ++i) {
+    necomimi_leds[i] = CRGB::Black;
+  }
+}
+
+static uint8_t necomimiLedLevelFromRatio(float ratio)
+{
+  if (ratio <= 0.02f) return 0;
+  if (ratio < 0.2f) return 1;
+  if (ratio < 0.4f) return 2;
+  if (ratio < 0.6f) return 3;
+  if (ratio < 0.8f) return 4;
+  return 5;
+}
+
+static void setNecomimiLedLevel(uint8_t level)
+{
+  if (level > NECOMIMI_LED_LEVELS) level = NECOMIMI_LED_LEVELS;
+  if (level == necomimi_led_last_level) return;
+  necomimi_led_last_level = level;
+
+  clearNecomimiLedBuffer();
+  const uint8_t pixels = NECOMIMI_LED_STAGE_PIXELS[level];
+  for (uint8_t i = 0; i < pixels; ++i) {
+    necomimi_leds[i] = NECOMIMI_LED_COLORS[i];
+    necomimi_leds[(NECOMIMI_LED_SIDE_COUNT - 1) - i] = NECOMIMI_LED_COLORS[i];
+    necomimi_leds[i + NECOMIMI_LED_SIDE_COUNT] = NECOMIMI_LED_COLORS[i];
+    necomimi_leds[(NECOMIMI_LED_SIDE_COUNT - 1) - i + NECOMIMI_LED_SIDE_COUNT] = NECOMIMI_LED_COLORS[i];
+  }
+  FastLED.show();
+}
+
+static void updateNecomimiLed(float ratio)
+{
+  setNecomimiLedLevel(necomimiLedLevelFromRatio(ratio));
+}
+
+static void initNecomimiLed()
+{
+  digitalWrite(NECOMIMI_LED_GPIO, LOW);
+  FastLED.addLeds<SK6812, NECOMIMI_LED_GPIO, GRB>(necomimi_leds, NECOMIMI_LED_COUNT);
+  FastLED.setBrightness(NECOMIMI_LED_BRIGHTNESS);
+  necomimi_led_last_level = 255;
+  setNecomimiLedLevel(0);
+  M5_LOGI("Necomimi LED initialized gpio:%d leds:%u levels:%u",
+          NECOMIMI_LED_GPIO, NECOMIMI_LED_COUNT, NECOMIMI_LED_LEVELS);
+}
+#else
+static void updateNecomimiLed(float) {}
+static void initNecomimiLed() {}
+#endif
 
 static void configureI2SLogLevel()
 {
@@ -316,10 +405,19 @@ static void connectWiFi(bool blocking)
   WiFi.setSleep(false);
   esp_wifi_set_ps(WIFI_PS_NONE);
   WiFi.setTxPower(WIFI_POWER_15dBm);
+  const static_ip_config_s* static_ip_config = system_config.getStaticIpConfig();
+  if (static_ip_config->enabled) {
+    if (!WiFi.config(static_ip_config->ip, static_ip_config->gateway,
+                     static_ip_config->subnet, static_ip_config->dns1,
+                     static_ip_config->dns2)) {
+      M5_LOGE("Failed to apply STATIC_IP config");
+    }
+  }
   WiFi.begin(wifi->ssid.c_str(), wifi->password.c_str());
   last_wifi_attempt_ms = millis();
 
-  M5_LOGI("Connecting WiFi SSID: %s", wifi->ssid.c_str());
+  M5_LOGI("Connecting WiFi SSID: %s%s", wifi->ssid.c_str(),
+          static_ip_config->enabled ? " with STATIC_IP" : "");
   drawStatus("Connecting WiFi...", wifi->ssid.c_str());
 
   if (!blocking) return;
@@ -849,6 +947,7 @@ void lipSync(void *args)
       mouth_ratio = 1.2f;
     }
     avatar->setMouthOpenRatio(mouth_ratio);
+    updateNecomimiLed(mouth_ratio);
 
     vTaskDelay(LIPSYNC_INTERVAL_TICKS);
   }
@@ -913,12 +1012,12 @@ void Servo_setup()
 void config_read()
 {
   if (sd_ready) {
-    system_config.loadConfig(SD, "");
+    system_config.loadConfig(SD, VBAN_EXT_CONFIG_FILENAME);
     return;
   }
 #if defined(USE_ATOMIC_ECHO_BASE)
   if (spiffs_ready) {
-    system_config.loadConfig(SPIFFS, "");
+    system_config.loadConfig(SPIFFS, VBAN_EXT_CONFIG_FILENAME);
   }
 #endif
 }
@@ -1093,6 +1192,7 @@ void setup()
 #if defined(ARDUINO_M5STACK_CORES3)
   unifiedButton.begin(&M5.Display, goblib::UnifiedButton::appearance_t::transparent_all);
 #endif
+  initNecomimiLed();
 
   {
     auto spk_cfg = M5.Speaker.config();

@@ -1,0 +1,7 @@
+# VBAN application settings.
+STATIC_IP:
+  ip: ""
+  gateway: ""
+  subnet: "255.255.255.0"
+  dns1: ""
+  dns2: ""
